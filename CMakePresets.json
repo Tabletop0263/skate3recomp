@@ -104,6 +104,18 @@
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release"
       }
+    },
+    {
+      "name": "wasm-release",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/build/wasm-release",
+      "toolchainFile": "$env{EMSDK}/upstream/emscripten/cmake/Modules/Platform/Emscripten.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_FLAGS": "-pthread -msimd128 -sMEMORY64=1",
+        "CMAKE_CXX_FLAGS": "-pthread -msimd128 -sMEMORY64=1",
+        "CMAKE_EXE_LINKER_FLAGS": "-pthread -sMEMORY64=1 -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=1gb -sMAXIMUM_MEMORY=8gb -sPTHREAD_POOL_SIZE=16 -sPROXY_TO_PTHREAD -sWASM_BIGINT -sOFFSCREENCANVAS_SUPPORT=1 -sFORCE_FILESYSTEM=1 -lopfs.js --use-port=emdawnwebgpu"
+      }
     }
   ],
   "buildPresets": [
