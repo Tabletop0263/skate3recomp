@@ -1,0 +1,448 @@
+From ee0d0e3471b3aa19ad8da51b292ea7798170eb13 Mon Sep 17 00:00:00 2001
+From: x <a@b>
+Date: Mon, 26 Oct 2026 23:13:11 +0000
+Subject: [PATCH] wasm: linear-arena memory backend with address folding
+
+---
+ include/rex/memory/wasm_fold.h          |  65 ++++++++++++++
+ include/rex/platform.h                  |   5 ++
+ include/rex/system/xmemory.h            |  20 +++++
+ resources/templates/codegen/init_h.inja |   5 +-
+ src/core/CMakeLists.txt                 |   2 +
+ src/core/memory_posix.cpp               |   4 +
+ src/core/memory_wasm.cpp                | 108 ++++++++++++++++++++++++
+ src/kernel/crt/heap.cpp                 |  11 +++
+ src/system/xmemory.cpp                  |  28 ++++++
+ 9 files changed, 247 insertions(+), 1 deletion(-)
+ create mode 100644 include/rex/memory/wasm_fold.h
+ create mode 100644 src/core/memory_wasm.cpp
+
+diff --git a/include/rex/memory/wasm_fold.h b/include/rex/memory/wasm_fold.h
+new file mode 100644
+index 0000000..ed7b2ab
+--- /dev/null
++++ b/include/rex/memory/wasm_fold.h
+@@ -0,0 +1,65 @@
++/**
++ * @file        wasm_fold.h
++ * @brief       Guest->linear address folding for the WebAssembly (memory64) build
++ *
++ * Native builds alias several guest views onto one backing file with mmap
++ * (MAP_FIXED).  WebAssembly linear memory cannot alias pages, so instead every
++ * guest address is "folded" into one compact arena:
++ *
++ *   guest 0x00000000-0x7EFFFFFF  -> arena + a                (identity, sparse)
++ *   guest 0x7F000000-0x7FFFFFFF  -> arena + P + (a-0x7F000000)  (GPU writeback)
++ *   guest 0x80000000-0x8FFFFFFF  -> arena + a                (xex 64k pages)
++ *   guest 0x90000000-0x9FFFFFFF  -> arena + a - 0x10000000   (xex 4k alias of 0x8...)
++ *   guest 0xA0000000-0xBFFFFFFF  -> arena + P + (a-0xA0000000)
++ *   guest 0xC0000000-0xDFFFFFFF  -> arena + P + (a-0xC0000000)
++ *   guest 0xE0000000-0xFFFFFFFF  -> arena + P + 0x1000 + (a-0xE0000000)
++ *
++ * P (kPhysBase) is the 512 MB physical block.  Because every boundary is
++ * 16 MB aligned, the per-address delta is one load from a 256-entry table
++ * indexed by (a >> 24).  Recompiled code already adds REX_PHYS_HOST_OFFSET(x)
++ * to every access, so the table slots straight into that hook.
++ */
++#pragma once
++
++#include <cstdint>
++
++namespace rex::memory::wasm {
++
++inline constexpr uint64_t kPhysBase = 0x90000000ull;
++inline constexpr uint64_t kPhysSize = 0x20000000ull;
++// +0x1000: the 0xE0000000 view is shifted by one 4 KB page.
++inline constexpr uint64_t kArenaSize = kPhysBase + kPhysSize + 0x1000ull;
++
++constexpr int64_t FoldDelta(uint32_t a) {
++  if (a < 0x7F000000u) return 0;
++  if (a < 0x80000000u) return int64_t(kPhysBase) - 0x7F000000ll;
++  if (a < 0x90000000u) return 0;
++  if (a < 0xA0000000u) return -0x10000000ll;
++  if (a < 0xC0000000u) return int64_t(kPhysBase) - 0xA0000000ll;
++  if (a < 0xE0000000u) return int64_t(kPhysBase) - 0xC0000000ll;
++  return int64_t(kPhysBase) + 0x1000ll - 0xE0000000ll;
++}
++
++struct FoldTable {
++  int64_t v[256];
++  constexpr FoldTable() : v() {
++    for (int i = 0; i < 256; ++i) v[i] = FoldDelta(uint32_t(i) << 24);
++  }
++};
++inline constexpr FoldTable kFoldTable{};
++
++/// Value to add to (base + guest_address) to reach the folded host address.
++inline int64_t HostDelta(uint32_t a) noexcept { return kFoldTable.v[a >> 24]; }
++/// Guest address -> offset from the arena base.
++inline int64_t Fold(uint32_t a) noexcept { return int64_t(a) + HostDelta(a); }
++
++/// Arena offset -> guest address (physical block is reported as a physical address,
++/// matching Memory::HostToGuestVirtual's truncation on native builds).
++inline uint32_t Unfold(uint64_t offset) noexcept {
++  return offset >= kPhysBase ? uint32_t(offset - kPhysBase) : uint32_t(offset);
++}
++
++/// Base of the arena (null until Memory::Initialize has created the mapping).
++uint8_t* ArenaBase();
++
++}  // namespace rex::memory::wasm
+diff --git a/include/rex/platform.h b/include/rex/platform.h
+index 57d8cf6..2502d71 100644
+--- a/include/rex/platform.h
++++ b/include/rex/platform.h
+@@ -38,12 +38,17 @@
+ #elif defined(__gnu_linux__)
+ #define REX_PLATFORM_GNU_LINUX 1
+ #define REX_PLATFORM_LINUX 1
++#elif defined(__EMSCRIPTEN__)
++#define REX_PLATFORM_WASM 1
+ #else
+ #error Unsupported target OS.
+ #endif
+ 
+ // Ensure all platform macros are always defined (0 when inactive)
+ // so they can be used in static_assert and regular expressions.
++#ifndef REX_PLATFORM_WASM
++#define REX_PLATFORM_WASM 0
++#endif
+ #ifndef REX_PLATFORM_MAC
+ #define REX_PLATFORM_MAC 0
+ #endif
+diff --git a/include/rex/system/xmemory.h b/include/rex/system/xmemory.h
+index 944e71f..eeccfed 100644
+--- a/include/rex/system/xmemory.h
++++ b/include/rex/system/xmemory.h
+@@ -18,6 +18,9 @@
+ #include <vector>
+ 
+ #include <rex/memory/utils.h>
++#if defined(__EMSCRIPTEN__)
++#include <rex/memory/wasm_fold.h>
++#endif
+ #include <rex/ppc/context.h>  // PPCFunc type (minimal header)
+ #include <rex/system/mmio_handler.h>
+ #include <rex/thread/mutex.h>
+@@ -32,9 +35,15 @@ namespace rex::memory::detail {
+ /// pages on the 0xE0000000 physical heap. The memory views are rounded down to
+ /// the host granularity, while the heap tracks the requested 4 KB-aligned guest
+ /// range via host_address_offset.
++#if defined(__EMSCRIPTEN__)
++inline int64_t PhysicalHostOffset(u32 guest_addr) noexcept {
++  return rex::memory::wasm::HostDelta(guest_addr);
++}
++#else
+ inline u32 PhysicalHostOffset(u32 guest_addr) noexcept {
+   return (guest_addr >= 0xE0000000u && allocation_granularity() > 0x1000) ? 0x1000u : 0u;
+ }
++#endif
+ 
+ }  // namespace rex::memory::detail
+ 
+@@ -157,6 +166,13 @@ class BaseHeap {
+ 
+   template <typename T = uint8_t*>
+   inline T TranslateRelative(size_t relative_address) const {
++#if defined(__EMSCRIPTEN__)
++    // Virtual-membase heaps alias in guest space: fold into the arena.
++    if (folds_) {
++      return reinterpret_cast<T>(membase_ + rex::memory::wasm::Fold(
++                                                static_cast<uint32_t>(heap_base_ + relative_address)));
++    }
++#endif
+     return reinterpret_cast<T>(membase_ + heap_base_ + host_address_offset_ + relative_address);
+   }
+ 
+@@ -245,6 +261,7 @@ class BaseHeap {
+   uint32_t page_size_;
+   uint32_t page_size_shift_ = 0;
+   uint32_t host_address_offset_;
++  bool folds_ = false;  // wasm: membase_ is the virtual base, so addresses need folding
+   uint32_t unreserved_page_count_ = 0;
+   rex::thread::global_critical_region global_critical_region_;
+   std::recursive_mutex heap_mutex_;
+@@ -356,6 +373,9 @@ class Memory {
+   // Note that the contents at the specified host address are big-endian.
+   template <typename T = uint8_t*>
+   inline T TranslateVirtual(uint32_t guest_address) const {
++#if defined(__EMSCRIPTEN__)
++    return reinterpret_cast<T>(virtual_membase_ + rex::memory::wasm::Fold(guest_address));
++#endif
+     uint8_t* host_address = virtual_membase_ + guest_address;
+     const auto heap = LookupHeap(guest_address);
+     if (heap) {
+diff --git a/resources/templates/codegen/init_h.inja b/resources/templates/codegen/init_h.inja
+index 5586034..5a4cd25 100644
+--- a/resources/templates/codegen/init_h.inja
++++ b/resources/templates/codegen/init_h.inja
+@@ -111,7 +111,10 @@ extern PPCFuncMapping {{ project }}_PPCFuncMappings[];
+ // Memory Access
+ //=============================================================================
+ 
+-#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
++#if defined(__EMSCRIPTEN__)
++#include <rex/memory/wasm_fold.h>
++#define REX_PHYS_HOST_OFFSET(addr) (::rex::memory::wasm::HostDelta((u32)(addr)))
++#elif REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
+ #define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
+ #else
+ #define REX_PHYS_HOST_OFFSET(addr) 0u
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 1f8f278..70904db 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -45,6 +45,8 @@ if(WIN32)
+         system_win.cpp
+         threading_win.cpp
+     )
++elseif(EMSCRIPTEN)
++    target_sources(rexcore PRIVATE memory_wasm.cpp)
+ elseif(UNIX)
+     target_sources(rexcore PRIVATE
+         atomic_posix.cpp
+diff --git a/src/core/memory_posix.cpp b/src/core/memory_posix.cpp
+index 34a51a9..c0b9b02 100644
+--- a/src/core/memory_posix.cpp
++++ b/src/core/memory_posix.cpp
+@@ -9,6 +9,8 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#ifndef __EMSCRIPTEN__
++
+ #include <cerrno>
+ #include <cstddef>
+ #include <cstdio>
+@@ -468,3 +470,5 @@ bool UnmapFileView(FileMappingHandle handle, void* base_address, size_t length)
+ 
+ }  // namespace memory
+ }  // namespace rex
++
++#endif  // !__EMSCRIPTEN__
+diff --git a/src/core/memory_wasm.cpp b/src/core/memory_wasm.cpp
+new file mode 100644
+index 0000000..f6f51b0
+--- /dev/null
++++ b/src/core/memory_wasm.cpp
+@@ -0,0 +1,108 @@
++/**
++ * @brief  WebAssembly (Emscripten, memory64) replacement for memory_posix.cpp
++ *
++ * No mmap aliasing, no mprotect, no page faults in WebAssembly.  The whole guest
++ * address space lives in one arena carved out of linear memory with sbrk()
++ * (fresh wasm pages are zero and engines commit them lazily on first touch, so
++ * the 2.75 GB span only costs what the game actually touches).  Aliased guest
++ * views are resolved by address folding, see rex/memory/wasm_fold.h.
++ *
++ * Known gap: Protect() is a no-op, so write-watch callbacks driven by page
++ * faults (EnablePhysicalMemoryAccessCallbacks) never fire.  The GPU
++ * shared-memory path needs explicit dirty tracking.
++ */
++#ifdef __EMSCRIPTEN__
++
++#include <unistd.h>
++
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++
++#include <rex/memory/utils.h>
++#include <rex/memory/wasm_fold.h>
++
++namespace rex {
++namespace memory {
++
++namespace {
++uint8_t* g_arena = nullptr;
++bool g_arena_used = false;
++
++bool InArena(const void* p, size_t length) {
++  auto a = reinterpret_cast<uintptr_t>(g_arena);
++  auto x = reinterpret_cast<uintptr_t>(p);
++  return g_arena && x >= a && x + length <= a + wasm::kArenaSize;
++}
++}  // namespace
++
++namespace wasm {
++uint8_t* ArenaBase() { return g_arena; }
++}  // namespace wasm
++
++size_t page_size() { return 4096; }
++// 4 KB on purpose: the 0xE0000000 +0x1000 shift is handled by the fold table.
++size_t allocation_granularity() { return 4096; }
++
++void* AllocFixed(void* base_address, size_t length, AllocationType, PageAccess) {
++  if (!base_address) {
++    void* p = nullptr;
++    if (posix_memalign(&p, 4096, length) != 0) return nullptr;
++    std::memset(p, 0, length);
++    return p;
++  }
++  // Reserve/commit inside the pre-zeroed arena are no-ops.
++  return InArena(base_address, length) ? base_address : nullptr;
++}
++
++bool DeallocFixed(void* base_address, size_t length, DeallocationType type) {
++  if (!InArena(base_address, length ? length : 1)) {
++    if (type == DeallocationType::kRelease) { std::free(base_address); return true; }
++    return false;
++  }
++  // Guests expect zero-filled pages on re-commit; MADV_DONTNEED does not exist
++  // here, so clear explicitly.  (length==0 on release means "whole region",
++  // which the heap code zero-initialises again on reuse.)
++  if (length) std::memset(base_address, 0, length);
++  return true;
++}
++
++bool Protect(void*, size_t, PageAccess, PageAccess* out_old_access) {
++  if (out_old_access) *out_old_access = PageAccess::kReadWrite;
++  return true;
++}
++
++bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
++  if (!InArena(base_address, 1)) { length = 0; access_out = PageAccess::kNoAccess; return false; }
++  length = reinterpret_cast<uintptr_t>(g_arena) + wasm::kArenaSize -
++           reinterpret_cast<uintptr_t>(base_address);
++  access_out = PageAccess::kReadWrite;
++  return true;
++}
++
++FileMappingHandle CreateFileMappingHandle(const std::filesystem::path&, size_t, PageAccess, bool) {
++  if (!g_arena) {
++    constexpr uintptr_t kAlign = 65536;
++    void* p = sbrk(static_cast<intptr_t>(wasm::kArenaSize + kAlign));
++    if (p == reinterpret_cast<void*>(-1)) return kFileMappingHandleInvalid;
++    g_arena = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(p) + kAlign - 1) & ~(kAlign - 1));
++  } else if (g_arena_used) {
++    std::memset(g_arena, 0, wasm::kArenaSize);  // re-initialisation: hand back a clean arena
++  }
++  g_arena_used = true;
++  return 1;
++}
++
++void CloseFileMappingHandle(FileMappingHandle, const std::filesystem::path&) {}
++
++// Views are resolved by folding in Memory::Initialize; these are only reached
++// through the generic code paths and are identity/no-ops here.
++void* MapFileView(FileMappingHandle, void* base_address, size_t, PageAccess, size_t) {
++  return base_address;
++}
++bool UnmapFileView(FileMappingHandle, void*, size_t) { return true; }
++
++}  // namespace memory
++}  // namespace rex
++
++#endif  // __EMSCRIPTEN__
+diff --git a/src/kernel/crt/heap.cpp b/src/kernel/crt/heap.cpp
+index 84c7c64..e7a4482 100644
+--- a/src/kernel/crt/heap.cpp
++++ b/src/kernel/crt/heap.cpp
+@@ -7,6 +7,9 @@
+  * @copyright   Copyright (c) 2026 Tom Clay <tomc@tctechstuff.com>
+  * @license     BSD 3-Clause License
+  */
++#if defined(__EMSCRIPTEN__)
++#include <rex/memory/wasm_fold.h>
++#endif
+ #include <rex/kernel/crt/heap.h>
+ 
+ #include <algorithm>
+@@ -57,11 +60,19 @@ constexpr uint32_t HEAP_ZERO_MEMORY = 0x00000008;
+ namespace rex::kernel::crt {
+ 
+ void* ReXHeap::GuestToHost(uint32_t guest_addr) const {
++#if defined(__EMSCRIPTEN__)
++  return membase_ + rex::memory::wasm::Fold(guest_addr);
++#else
+   return membase_ + guest_addr;
++#endif
+ }
+ 
+ uint32_t ReXHeap::HostToGuest(void* host_ptr) const {
++#if defined(__EMSCRIPTEN__)
++  return rex::memory::wasm::Unfold(static_cast<uint8_t*>(host_ptr) - membase_);
++#else
+   return static_cast<uint32_t>(static_cast<uint8_t*>(host_ptr) - membase_);
++#endif
+ }
+ 
+ bool ReXHeap::InHeap(uint32_t guest_addr) const {
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 0c542aa..87771d8 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -173,6 +173,18 @@ bool Memory::Initialize() {
+   // Attempt to create our views. This may fail at the first address
+   // we pick, so try a few times.
+   mapping_base_ = 0;
++#if defined(__EMSCRIPTEN__)
++  // One arena, aliased views resolved by folding (see rex/memory/wasm_fold.h).
++  if (uint8_t* arena = rex::memory::wasm::ArenaBase()) {
++    for (size_t n = 0; n < rex::countof(map_info); n++) {
++      const uint64_t start = map_info[n].virtual_address_start;
++      views_.all_views[n] = arena + (start >= 0x100000000ull
++                                         ? rex::memory::wasm::kPhysBase
++                                         : uint64_t(rex::memory::wasm::Fold(uint32_t(start))));
++    }
++    mapping_base_ = arena;
++  }
++#else
+   for (size_t n = 32; n < 64; n++) {
+     auto mapping_base = reinterpret_cast<uint8_t*>(1ull << n);
+     if (!MapViews(mapping_base)) {
+@@ -187,13 +199,18 @@ bool Memory::Initialize() {
+     }
+   }
+ #endif
++#endif  // __EMSCRIPTEN__
+   if (!mapping_base_) {
+     REXSYS_ERROR("Unable to find a continuous block in the 64bit address space.");
+     assert_always();
+     return false;
+   }
+   virtual_membase_ = mapping_base_;
++#if defined(__EMSCRIPTEN__)
++  physical_membase_ = mapping_base_ + rex::memory::wasm::kPhysBase;
++#else
+   physical_membase_ = mapping_base_ + 0x100000000ull;
++#endif
+   // Prepare virtual heaps.
+   heaps_.v00000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestVirtual, 0x00000000,
+                               0x40000000, 4096);
+@@ -248,7 +265,11 @@ bool Memory::Initialize() {
+   // The 0x7F000000-0x7FFFFFFF view aliases the start of physical memory. Touch
+   // it explicitly on macOS so raw generated loads through this alias don't SIGBUS
+   // before any guest write has materialized the shared-memory pages.
++#if defined(__EMSCRIPTEN__)
++  std::memset(virtual_membase_ + rex::memory::wasm::Fold(0x7F000000u), 0, 0x01000000);
++#else
+   std::memset(virtual_membase_ + 0x7F000000, 0, 0x01000000);
++#endif
+ #endif
+ 
+   // Install MMIO handler for physical address translation and MMIO ranges
+@@ -453,6 +474,10 @@ VirtualHeap* Memory::GetPhysicalHeap() {
+ }
+ 
+ uint32_t Memory::HostToGuestVirtual(const void* host_address) const {
++#if defined(__EMSCRIPTEN__)
++  return rex::memory::wasm::Unfold(reinterpret_cast<size_t>(host_address) -
++                                   reinterpret_cast<size_t>(virtual_membase_));
++#endif
+   size_t virtual_address =
+       reinterpret_cast<size_t>(host_address) - reinterpret_cast<size_t>(virtual_membase_);
+   uint32_t vE0000000_host_offset = heaps_.vE0000000.host_address_offset();
+@@ -918,6 +943,9 @@ void BaseHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType hea
+   assert_true(rex::is_pow2(page_size_));
+   page_size_shift_ = rex::log2_floor(page_size_);
+   host_address_offset_ = host_address_offset;
++#if defined(__EMSCRIPTEN__)
++  folds_ = (membase_ == memory->virtual_membase());
++#endif
+   page_table_.resize(heap_size / page_size);
+   unreserved_page_count_ = uint32_t(page_table_.size());
+ }
+-- 
+2.43.0
+
