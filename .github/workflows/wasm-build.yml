@@ -76,10 +76,13 @@ jobs:
       - name: Add swap (big generated TUs can exceed runner RAM)
         run: |
           set -e
-          sudo fallocate -l 12G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          if ! swapon --show=NAME --noheadings | grep -qx '/swapfile-build'; then
+            sudo rm -f /swapfile-build
+            sudo fallocate -l 12G /swapfile-build || sudo fallocate -l 6G /swapfile-build
+            sudo chmod 600 /swapfile-build
+            sudo mkswap /swapfile-build
+            sudo swapon /swapfile-build
+          fi
           free -h
 
       - name: Apply rexglue wasm patch
