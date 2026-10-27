@@ -1,4 +1,4 @@
-name: main
+name: wasm-build.yml
 
 on:
   workflow_dispatch:
