@@ -167,14 +167,21 @@ jobs:
           version: latest
           actions-cache-folder: emsdk-cache
 
-      - name: Configure (wasm)
+       - name: Configure (wasm)
+         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           EM_ROOT="$(dirname "$(which emcc)")"
-          cmake --preset wasm-release \
+
+          emcmake cmake --preset wasm-release \
             -DCMAKE_TOOLCHAIN_FILE="$EM_ROOT/cmake/Modules/Platform/Emscripten.cmake" \
             -DCMAKE_EXECUTABLE_SUFFIX=.html \
-            -DSKATE3_GAME_DATA_ROOT="$PWD/game" 2>&1 | tee configure-wasm.log
+            -DCMAKE_THREAD_LIBS_INIT=-pthread \
+            -DThreads_FOUND=TRUE \
+            -DSKATE3_GAME_DATA_ROOT="$PWD/game" \
+            2>&1 | tee configure-wasm.log
+
+          test -f out/build/wasm-release/build.ninja
 
       - name: Build (wasm)
         run: cmake --build out/build/wasm-release --parallel 2>&1 | tee build-wasm.log
