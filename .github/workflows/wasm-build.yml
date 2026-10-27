@@ -36,7 +36,6 @@ jobs:
   build:
     # The generated code and wasm are derived from the retail game.
     # Never build this in a public repo: Actions artifacts there are downloadable by anyone.
-    if: ${{ github.event.repository.private == true }}
     runs-on: ubuntu-24.04
     timeout-minutes: 360
     steps:
