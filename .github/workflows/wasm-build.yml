@@ -41,7 +41,30 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          # Initialize dependencies manually so the unavailable ImGui gitlink can be replaced.
+          submodules: false
+
+      - name: Initialize ReXGlue dependencies (repair unavailable ImGui pin)
+        shell: bash
+        run: |
+          set -euo pipefail
+          git submodule update --init --depth=1 third_party/rexglue-sdk
+          SDK="$PWD/third_party/rexglue-sdk"
+          git -C "$SDK" submodule sync
+
+          mapfile -t SDK_SUBMODULES < <(
+            git -C "$SDK" config --file .gitmodules --get-regexp '^submodule\..*\.path$' \
+              | awk '$2 != "thirdparty/imgui" { print $2 }'
+          )
+          if [[ ${#SDK_SUBMODULES[@]} -gt 0 ]]; then
+            git -C "$SDK" submodule update --init --depth=1 --recursive "${SDK_SUBMODULES[@]}"
+          fi
+
+          rm -rf "$SDK/thirdparty/imgui"
+          git clone --depth 1 --branch v1.91.9b \
+            https://github.com/ocornut/imgui.git "$SDK/thirdparty/imgui"
+          test -f "$SDK/thirdparty/imgui/imgui.h"
+          git -C "$SDK/thirdparty/imgui" rev-parse --short HEAD
 
       - name: Free runner disk space for the ISO and generated sources
         run: |
