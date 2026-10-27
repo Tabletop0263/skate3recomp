@@ -1,0 +1,142 @@
+name: wasm-build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [wasm]
+    paths:
+      - 'src/**'
+      - 'cmake/**'
+      - 'config/**'
+      - 'patches/**'
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      - '.github/workflows/wasm-build.yml'
+
+concurrency:
+  group: wasm-build
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # The generated code and the wasm are derived from the retail game.
+    # Never build this in a public repo: Actions artifacts there are downloadable by anyone.
+    if: ${{ github.event.repository.private == true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Add swap (big generated TUs can exceed runner RAM)
+        run: |
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Apply rexglue wasm patch
+        run: |
+          set -e
+          P="$PWD/patches/rexglue-wasm-memory.patch"
+          test -f "$P"
+          if git -C third_party/rexglue-sdk apply --check -R "$P" 2>/dev/null; then
+            echo "patch already applied"
+          else
+            git -C third_party/rexglue-sdk apply "$P"
+          fi
+
+      - name: Ensure wasm-release preset exists
+        run: |
+          set -e
+          if ! jq -e '.configurePresets[] | select(.name=="wasm-release")' CMakePresets.json >/dev/null; then
+            jq '.configurePresets += [{
+              "name": "wasm-release", "displayName": "WASM Release", "inherits": "base",
+              "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "REXGLUE_USE_VULKAN": "OFF", "REXGLUE_USE_D3D12": "OFF", "REXGLUE_USE_WEBGPU": "ON",
+                "CMAKE_C_FLAGS": "-pthread -msimd128 -sMEMORY64=1",
+                "CMAKE_CXX_FLAGS": "-pthread -msimd128 -sMEMORY64=1",
+                "CMAKE_EXE_LINKER_FLAGS": "-pthread -sMEMORY64=1 -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=1gb -sMAXIMUM_MEMORY=8gb -sPTHREAD_POOL_SIZE=16 -sPROXY_TO_PTHREAD -sWASM_BIGINT -sOFFSCREENCANVAS_SUPPORT=1 -sFORCE_FILESYSTEM=1 -lopfs.js --use-port=emdawnwebgpu"
+              }}]' CMakePresets.json > p.tmp && mv p.tmp CMakePresets.json
+          fi
+
+      - name: Fetch your own game inputs (private archive)
+        env:
+          GAME_INPUTS_URL: ${{ secrets.GAME_INPUTS_URL }}
+        run: |
+          set -e
+          test -n "$GAME_INPUTS_URL" || { echo "::error::Add repo secret GAME_INPUTS_URL (see README in chat)"; exit 1; }
+          echo "::add-mask::$GAME_INPUTS_URL"
+          curl -fL --retry 3 -o inputs.7z "$GAME_INPUTS_URL"
+          sudo apt-get update -qq && sudo apt-get install -y -qq p7zip-full
+          7z x -y inputs.7z -o. >/dev/null
+          rm inputs.7z
+          test -f game/default.xex
+          test -f game/data/webkit/EAWebkit.xex
+          ls TU_12K2276_000000C000000.00000000000O3
+
+      - name: Install native toolchain (codegen runs natively)
+        run: |
+          set -e
+          wget -q https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 20
+          sudo apt-get install -y -qq git cmake ninja-build build-essential pkg-config \
+            clang-20 lld-20 libgtk-3-dev libx11-xcb-dev libvulkan-dev vulkan-tools \
+            mesa-vulkan-drivers libasound2-dev libpulse-dev libpipewire-0.3-dev libudev-dev
+
+      - name: Codegen (native)
+        run: |
+          set -e
+          cmake --preset linux-release -DSKATE3_GAME_DATA_ROOT="$PWD/game"
+          cmake --build --preset linux-release --target generate-all --parallel 2>&1 | tee codegen.log
+          du -sh generated || true
+          find generated -name '*.cpp' | wc -l
+
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest
+          actions-cache-folder: emsdk-cache
+
+      - name: Configure (wasm)
+        run: |
+          set -e
+          EM_ROOT="$(dirname "$(which emcc)")"
+          cmake --preset wasm-release \
+            -DCMAKE_TOOLCHAIN_FILE="$EM_ROOT/cmake/Modules/Platform/Emscripten.cmake" \
+            -DCMAKE_EXECUTABLE_SUFFIX=.html \
+            -DSKATE3_GAME_DATA_ROOT="$PWD/game" 2>&1 | tee configure-wasm.log
+
+      - name: Build (wasm)
+        run: cmake --build out/build/wasm-release --parallel 2>&1 | tee build-wasm.log
+
+      - name: Collect output
+        run: |
+          mkdir -p dist
+          cp out/build/wasm-release/skate3.* dist/
+          cp web/serve.py dist/
+          ls -lh dist
+
+      - name: Upload build (private repo artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: skate3-wasm
+          path: dist/
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            *.log
+            out/build/**/CMakeFiles/CMakeError.log
+            out/build/**/CMakeFiles/CMakeOutput.log
+          retention-days: 7
+          if-no-files-found: ignore
