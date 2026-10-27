@@ -194,13 +194,45 @@ jobs:
           actions-cache-folder: emsdk-cache
 
       - name: Configure (wasm)
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
           EM_ROOT="$(dirname "$(which emcc)")"
           cmake --preset wasm-release \
             -DCMAKE_TOOLCHAIN_FILE="$EM_ROOT/cmake/Modules/Platform/Emscripten.cmake" \
             -DCMAKE_EXECUTABLE_SUFFIX=.html \
-            -DSKATE3_GAME_DATA_ROOT="$PWD/game" 2>&1 | tee configure-wasm.log
+            -DSKATE3_GAME_DATA_ROOT="$PWD/game" \
+            2>&1 | tee configure-wasm.log
+
+          if [[ ! -f out/build/wasm-release/build.ninja ]]; then
+            echo "::error::CMake did not create out/build/wasm-release/build.ninja"
+            echo "Available build directories:"
+            find out/build -maxdepth 3 -name build.ninja -print 2>/dev/null || true
+            echo "Configure log:"
+            tail -100 configure-wasm.log
+            exit 1
+          fi
+
+      - name: Build (wasm)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build out/build/wasm-release --parallel 2 \
+            2>&1 | tee build-wasm.log
+
+      - name: Collect output
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if ! compgen -G 'out/build/wasm-release/skate3.*' > /dev/null; then
+            echo "::error::Build produced no skate3.* output files"
+            tail -100 build-wasm.log 2>/dev/null || true
+            exit 1
+          fi
+          cp out/build/wasm-release/skate3.* dist/
+          cp web/serve.py dist/
+          ls -lh dist
 
       - name: Build (wasm)
         run: cmake --build out/build/wasm-release --parallel 2>&1 | tee build-wasm.log
