@@ -1,0 +1,209 @@
+name: wasm-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      title_update_url:
+        description: 'Optional direct HTTPS URL for TU3 (defaults to the known TU3 download endpoint)'
+        required: false
+        default: 'https://xboxunity.net/Resources/Lib/TitleUpdate.php?tuid=21774'
+        type: string
+  push:
+    branches: [wasm]
+    paths:
+      - 'src/**'
+      - 'cmake/**'
+      - 'config/**'
+      - 'patches/**'
+      - 'CMakeLists.txt'
+      - 'CMakePresets.json'
+      - '.github/workflows/wasm-build.yml'
+
+concurrency:
+  group: wasm-build
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+# The Drive file must be shared as "Anyone with the link" (Viewer).
+# This makes the file accessible to anyone who obtains the link; it is not private hosting.
+env:
+  DRIVE_FILE_ID: 19AZ-nePoBTTnmneJ7xHIx4sKw093j699
+  TITLE_UPDATE_URL: ${{ inputs.title_update_url || 'https://xboxunity.net/Resources/Lib/TitleUpdate.php?tuid=21774' }}
+
+jobs:
+  build:
+    # The generated code and wasm are derived from the retail game.
+    # Never build this in a public repo: Actions artifacts there are downloadable by anyone.
+    if: ${{ github.event.repository.private == true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Free runner disk space for the ISO and generated sources
+        run: |
+          set -e
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h /
+
+      - name: Add swap (big generated TUs can exceed runner RAM)
+        run: |
+          set -e
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+
+      - name: Apply rexglue wasm patch
+        run: |
+          set -e
+          P="$PWD/patches/rexglue-wasm-memory.patch"
+          test -f "$P"
+          if git -C third_party/rexglue-sdk apply --check -R "$P" 2>/dev/null; then
+            echo "patch already applied"
+          else
+            git -C third_party/rexglue-sdk apply "$P"
+          fi
+
+      - name: Ensure wasm-release preset exists
+        run: |
+          set -e
+          if ! jq -e '.configurePresets[] | select(.name=="wasm-release")' CMakePresets.json >/dev/null; then
+            jq '.configurePresets += [{
+              "name": "wasm-release", "displayName": "WASM Release", "inherits": "base",
+              "cacheVariables": {
+                "CMAKE_BUILD_TYPE": "Release",
+                "REXGLUE_USE_VULKAN": "OFF", "REXGLUE_USE_D3D12": "OFF", "REXGLUE_USE_WEBGPU": "ON",
+                "CMAKE_C_FLAGS": "-pthread -msimd128 -sMEMORY64=1",
+                "CMAKE_CXX_FLAGS": "-pthread -msimd128 -sMEMORY64=1",
+                "CMAKE_EXE_LINKER_FLAGS": "-pthread -sMEMORY64=1 -sALLOW_MEMORY_GROWTH=1 -sINITIAL_MEMORY=1gb -sMAXIMUM_MEMORY=8gb -sPTHREAD_POOL_SIZE=16 -sPROXY_TO_PTHREAD -sWASM_BIGINT -sOFFSCREENCANVAS_SUPPORT=1 -sFORCE_FILESYSTEM=1 -lopfs.js --use-port=emdawnwebgpu"
+              }}]' CMakePresets.json > p.tmp && mv p.tmp CMakePresets.json
+          fi
+
+      - name: Install native toolchain and ISO extractor
+        run: |
+          set -e
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh 20
+          sudo apt-get install -y -qq git cmake ninja-build build-essential pkg-config \
+            clang-20 lld-20 libgtk-3-dev libx11-xcb-dev libvulkan-dev vulkan-tools \
+            mesa-vulkan-drivers libasound2-dev libpulse-dev libpipewire-0.3-dev libudev-dev
+          git clone --depth 1 https://github.com/XboxDev/extract-xiso.git /tmp/extract-xiso
+          cmake -S /tmp/extract-xiso -B /tmp/extract-xiso/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build /tmp/extract-xiso/build --parallel 2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Download and extract the Xbox 360 ISO from Google Drive
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check gdown
+          echo "Downloading the shared Google Drive ISO..."
+          gdown --fuzzy "https://drive.google.com/file/d/${DRIVE_FILE_ID}/view?usp=drivesdk" -O skate3.iso
+          test -s skate3.iso
+          file skate3.iso
+          if [[ "$(stat -c '%s' skate3.iso)" -lt 1000000000 ]]; then
+            echo "::error::The downloaded file is unexpectedly small for a Skate 3 Xbox 360 ISO. Check Drive sharing, the file ID, and whether Google Drive download limits were reached."
+            exit 1
+          fi
+          mkdir -p game
+          /tmp/extract-xiso/build/extract-xiso skate3.iso -d "$PWD/game"
+          rm -f skate3.iso
+
+          # The build expects the game dump at these exact paths.
+          if [[ ! -f game/default.xex ]]; then
+            echo "::error::The extracted ISO does not contain game/default.xex at its root. Check that this is the correct Xbox 360 Skate 3 ISO."
+            find game -maxdepth 3 -type f | head -80 || true
+            exit 1
+          fi
+          if [[ ! -f game/data/webkit/EAWebkit.xex ]]; then
+            WEBKIT_FILE="$(find game -type f -iname 'EAWebkit.xex' -print -quit || true)"
+            if [[ -n "$WEBKIT_FILE" ]]; then
+              mkdir -p game/data/webkit
+              cp "$WEBKIT_FILE" game/data/webkit/EAWebkit.xex
+            else
+              echo "::error::The extracted ISO is missing data/webkit/EAWebkit.xex. Check the ISO and its extraction."
+              exit 1
+            fi
+          fi
+          ls -lh game/default.xex game/data/webkit/EAWebkit.xex
+
+      - name: Download the separate TU3 package required by codegen
+        run: |
+          set -euo pipefail
+          case "$TITLE_UPDATE_URL" in
+            https://*) ;;
+            *) echo "::error::title_update_url must be a direct HTTPS download URL."; exit 1 ;;
+          esac
+          TU_FILE="TU_12K2276_000000C000000.00000000000O3"
+          curl --fail --location --retry 3 --retry-all-errors --connect-timeout 30 \
+            --output "$TU_FILE" "$TITLE_UPDATE_URL"
+          test -s "$TU_FILE"
+          if [[ "$(stat -c '%s' "$TU_FILE")" -lt 100000 ]]; then
+            echo "::error::The TU3 download looks too small to be the update package. Provide a direct download URL in title_update_url."
+            file "$TU_FILE" || true
+            exit 1
+          fi
+          ls -lh "$TU_FILE"
+
+      - name: Codegen (native)
+        run: |
+          set -e
+          cmake --preset linux-release -DSKATE3_GAME_DATA_ROOT="$PWD/game"
+          cmake --build --preset linux-release --target generate-all --parallel 2>&1 | tee codegen.log
+          du -sh generated || true
+          find generated -name '*.cpp' | wc -l
+
+      - uses: mymindstorm/setup-emsdk@v14
+        with:
+          version: latest
+          actions-cache-folder: emsdk-cache
+
+      - name: Configure (wasm)
+        run: |
+          set -e
+          EM_ROOT="$(dirname "$(which emcc)")"
+          cmake --preset wasm-release \
+            -DCMAKE_TOOLCHAIN_FILE="$EM_ROOT/cmake/Modules/Platform/Emscripten.cmake" \
+            -DCMAKE_EXECUTABLE_SUFFIX=.html \
+            -DSKATE3_GAME_DATA_ROOT="$PWD/game" 2>&1 | tee configure-wasm.log
+
+      - name: Build (wasm)
+        run: cmake --build out/build/wasm-release --parallel 2>&1 | tee build-wasm.log
+
+      - name: Collect output
+        run: |
+          set -e
+          mkdir -p dist
+          cp out/build/wasm-release/skate3.* dist/
+          cp web/serve.py dist/
+          ls -lh dist
+
+      - name: Upload build (private repo artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: skate3-wasm
+          path: dist/
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            *.log
+            out/build/**/CMakeFiles/CMakeError.log
+            out/build/**/CMakeFiles/CMakeOutput.log
+          retention-days: 7
+          if-no-files-found: ignore
