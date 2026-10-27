@@ -133,7 +133,7 @@ jobs:
           set -euo pipefail
           python -m pip install --disable-pip-version-check gdown
           echo "Downloading the shared Google Drive ISO..."
-          gdown --fuzzy "https://drive.google.com/file/d/${DRIVE_FILE_ID}/view?usp=drivesdk" -O skate3.iso
+          gdown "https://drive.google.com/file/d/${DRIVE_FILE_ID}/view?usp=drivesdk" -O skate3.iso
           test -s skate3.iso
           file skate3.iso
           if [[ "$(stat -c '%s' skate3.iso)" -lt 1000000000 ]]; then
